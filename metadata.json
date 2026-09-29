@@ -1,0 +1,6 @@
+{
+  "name": "ZYFEN MUSIC",
+  "description": "A modern, reliable music player with online streaming, local offline audio playback, playlists, favorites, and history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
