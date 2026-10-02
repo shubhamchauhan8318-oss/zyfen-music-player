@@ -15,15 +15,21 @@ import com.zyfen.music.data.local.SongDao
 import com.zyfen.music.data.media.Song
 import com.zyfen.music.data.media.toEntity
 import com.zyfen.music.data.prefs.SettingsStore
+import com.zyfen.music.data.source.ArtworkCache
+import com.zyfen.music.data.source.PlaybackResolver
+import com.zyfen.music.data.source.PlaybackResult
+import com.zyfen.music.data.source.TrackIdentity
 import com.zyfen.music.data.youtube.YouTubeSource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import java.util.concurrent.atomic.AtomicLong
 
 class PlayerManager(
     private val context: Context,
     private val settings: SettingsStore,
     private val youtube: YouTubeSource,
-    private val songDao: SongDao
+    private val songDao: SongDao,
+    private val resolver: PlaybackResolver = PlaybackResolver(youtube)
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var controller: MediaController? = null
@@ -60,7 +66,11 @@ class PlayerManager(
     private val _resolveStage = MutableStateFlow("")
     val resolveStage: StateFlow<String> = _resolveStage.asStateFlow()
 
-    private var queueGen = 0
+    private val _volume = MutableStateFlow(1.0f)
+    val volume: StateFlow<Float> = _volume.asStateFlow()
+
+    private val requestIdGenerator = AtomicLong(0)
+    private var playJob: Job? = null
     private var prefetchJob: Job? = null
     private var retryJob: Job? = null
 
@@ -145,6 +155,7 @@ class PlayerManager(
                     })
                     c.shuffleModeEnabled = _shuffle.value
                     c.repeatMode = _repeat.value
+                    c.volume = _volume.value
                     lostTicks = 0
                     tryFlush()
                 } catch (e: Exception) {
@@ -182,6 +193,7 @@ class PlayerManager(
     private fun mediaItem(s: Song, streamUrl: String): MediaItem {
         urlToSong[streamUrl] = s.id
         songUrls[s.id] = streamUrl
+        val art = s.artworkUri?.ifBlank { null } ?: ArtworkCache.get(TrackIdentity.fromSong(s))
         return MediaItem.Builder()
             .setUri(streamUrl)
             .setMediaId(s.id)
@@ -190,7 +202,7 @@ class PlayerManager(
                     .setTitle(s.title)
                     .setArtist(s.artist)
                     .setAlbumTitle(s.album)
-                    .setArtworkUri(s.artworkUri?.let { android.net.Uri.parse(it) })
+                    .setArtworkUri(art?.let { android.net.Uri.parse(it) })
                     .build()
             ).build()
     }
@@ -253,8 +265,6 @@ class PlayerManager(
     /**
      * Resilient stream error handler.
      * Prevents background errors from killing the currently playing song.
-     * On playback failure, it attempts up to MAX_STREAM_ATTEMPTS fresh stream resolutions
-     * across available formats/sources before showing a user error.
      */
     private fun handlePlaybackError(error: androidx.media3.common.PlaybackException, detail: String) {
         val dataUrl = extractFailedUrl(error)
@@ -263,10 +273,9 @@ class PlayerManager(
         }
 
         val active = currentSong.value
-        // If the error occurred on an unplayed background/prefetch item, do NOT stop active playback!
         if (errorSong != null && active != null && errorSong.id != active.id) {
             Log.w(TAG, "Prefetch item failed: '${errorSong.title}' — ignoring to keep active song playing")
-            if (dataUrl != null) youtube.markFailed(errorSong.id, dataUrl)
+            if (dataUrl != null) resolver.markStreamFailed(errorSong.id, dataUrl)
             return
         }
 
@@ -279,15 +288,15 @@ class PlayerManager(
 
         val failedUrl = dataUrl ?: songUrls[song.id]
         if (failedUrl != null) {
-            youtube.markFailed(song.id, failedUrl)
+            resolver.markStreamFailed(song.id, failedUrl)
         }
 
         streamAttempts++
         if (streamAttempts > MAX_STREAM_ATTEMPTS) {
-            youtube.clearFailures(song.id)
+            resolver.clearFailures(song.id)
             _isPreparing.value = false
             Log.e(TAG, "All stream options exhausted for '${song.title}' — $detail")
-            _events.tryEmit("Stream unavailable. Tap retry to reload.")
+            _events.tryEmit("Unable to verify playback source: $detail")
             return
         }
 
@@ -295,80 +304,87 @@ class PlayerManager(
 
         Log.i(TAG, "Retry attempt $streamAttempts/$MAX_STREAM_ATTEMPTS for '${song.title}'")
         _isPreparing.value = true
-        _resolveStage.value = "Connecting audio stream ($streamAttempts/$MAX_STREAM_ATTEMPTS)…"
+        _resolveStage.value = "Refreshing audio stream ($streamAttempts/$MAX_STREAM_ATTEMPTS)…"
         retryJob = scope.launch { retryLoop(song) }
     }
 
     private suspend fun retryLoop(song: Song) {
-        val gen = queueGen
+        val reqId = requestIdGenerator.get()
         try {
             while (
-                gen == queueGen &&
+                reqId == requestIdGenerator.get() &&
                 currentSong.value?.id == song.id &&
                 streamAttempts in 1..MAX_STREAM_ATTEMPTS
             ) {
                 val attemptNo = streamAttempts
                 _isPreparing.value = true
                 _resolveStage.value = "Connecting audio stream ($attemptNo/$MAX_STREAM_ATTEMPTS)…"
-                val url = streamFor(song)
-                if (gen != queueGen) return
-                if (url == null) {
-                    youtube.clearFailures(song.id)
-                    Log.e(TAG, "Retry exhausted: no stream left for '${song.title}' — ${youtube.lastError}")
-                    _events.tryEmit("Stream unavailable: ${youtube.lastError.take(70)}")
-                    return
-                }
-                if (currentSong.value?.id != song.id) return
-                Log.i(TAG, "Retry $attemptNo: applying fresh stream for '${song.title}'")
-                val c = controller
-                if (c != null && c.isConnected) {
-                    val idx = indexOfItem(c, song.id)
-                    val resumePos = _position.value.coerceAtLeast(0)
-                    if (idx >= 0) {
-                        c.replaceMediaItem(idx, mediaItem(song, url))
-                        c.seekTo(idx, resumePos)
-                        c.prepare()
-                        c.play()
-                    } else {
-                        val pos = (c.currentMediaItemIndex + 1).coerceAtMost(c.mediaItemCount)
-                        c.addMediaItem(pos, mediaItem(song, url))
-                        c.seekTo(pos, resumePos)
-                        c.prepare()
-                        c.play()
+
+                val identity = TrackIdentity.fromSong(song)
+                val result = resolver.resolve(identity)
+                if (reqId != requestIdGenerator.get()) return
+
+                when (result) {
+                    is PlaybackResult.Success -> {
+                        if (currentSong.value?.id != song.id) return
+                        Log.i(TAG, "Retry $attemptNo: applying fresh verified stream for '${song.title}'")
+                        val c = controller
+                        if (c != null && c.isConnected) {
+                            val idx = indexOfItem(c, song.id)
+                            val resumePos = _position.value.coerceAtLeast(0)
+                            if (idx >= 0) {
+                                c.replaceMediaItem(idx, mediaItem(song, result.streamUrl))
+                                c.seekTo(idx, resumePos)
+                                c.prepare()
+                                c.play()
+                            } else {
+                                val pos = (c.currentMediaItemIndex + 1).coerceAtMost(c.mediaItemCount)
+                                c.addMediaItem(pos, mediaItem(song, result.streamUrl))
+                                c.seekTo(pos, resumePos)
+                                c.prepare()
+                                c.play()
+                            }
+                        } else {
+                            pendingItems = listOf(mediaItem(song, result.streamUrl))
+                            pendingStartIndex = 0
+                            tryFlush()
+                        }
+
+                        val deadline = System.currentTimeMillis() + 10_000L
+                        while (
+                            reqId == requestIdGenerator.get() && streamAttempts == attemptNo &&
+                            !_isPlaying.value && currentSong.value?.id == song.id &&
+                            System.currentTimeMillis() < deadline
+                        ) delay(200)
+
+                        if (_isPlaying.value) {
+                            streamAttempts = 0
+                            Log.i(TAG, "Retry $attemptNo: stream playback started successfully for '${song.title}'")
+                            return
+                        }
+                        if (streamAttempts != attemptNo) continue
+                        Log.w(TAG, "Retry $attemptNo: timeout waiting for audio start")
+                        return
                     }
-                } else {
-                    pendingItems = listOf(mediaItem(song, url))
-                    pendingStartIndex = 0
-                    tryFlush()
+                    is PlaybackResult.Unavailable -> {
+                        resolver.clearFailures(song.id)
+                        Log.e(TAG, "Retry exhausted: ${result.reason}")
+                        _events.tryEmit("Stream unavailable: ${result.reason}")
+                        return
+                    }
                 }
-
-                val deadline = System.currentTimeMillis() + 10_000L
-                while (
-                    gen == queueGen && streamAttempts == attemptNo &&
-                    !_isPlaying.value && currentSong.value?.id == song.id &&
-                    System.currentTimeMillis() < deadline
-                ) delay(200)
-
-                if (_isPlaying.value) {
-                    streamAttempts = 0
-                    Log.i(TAG, "Retry $attemptNo: stream playback started successfully for '${song.title}'")
-                    return
-                }
-                if (streamAttempts != attemptNo) continue
-                Log.w(TAG, "Retry $attemptNo: timeout waiting for audio start")
-                return
             }
         } finally {
-            if (gen == queueGen) {
+            if (reqId == requestIdGenerator.get()) {
                 _resolveStage.value = ""
                 _isPreparing.value = false
             }
         }
     }
 
-    private fun persistVideoId(song: Song) {
-        val vid = youtube.videoIdOf(song) ?: return
-        val uri = YouTubeSource.VT + vid
+    private fun persistVideoId(song: Song, streamUrl: String) {
+        val vid = youtube.videoIdOf(song)
+        val uri = vid?.let { YouTubeSource.VT + it } ?: if (song.isLocal) song.contentUri else return
         if (song.contentUri == uri) return
         scope.launch(Dispatchers.IO) {
             runCatching { songDao.upsert(song.copy(contentUri = uri).toEntity()) }
@@ -376,71 +392,82 @@ class PlayerManager(
         _queue.value = _queue.value.map { if (it.id == song.id) it.copy(contentUri = uri) else it }
     }
 
-    private suspend fun streamFor(s: Song): String? = try {
-        if (s.isLocal) s.contentUri.takeIf { it.isNotBlank() && !it.startsWith(YouTubeSource.VT) }
-        else withTimeoutOrNull(RESOLVE_TIMEOUT_MS) { youtube.resolve(s)?.url }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (_: Exception) {
-        null
-    }
-
+    /**
+     * Primary Playback Dispatcher with Race Condition Cancellation.
+     * Guaranteed: When user clicks Song B while Song A is resolving, Song A is cancelled immediately.
+     */
     fun playSongs(songs: List<Song>, startIndex: Int = 0) {
         val list = songs.filter { isPlayable(it) }
         if (list.isEmpty()) return
         val start = startIndex.coerceIn(list.indices)
-        queueGen++
-        val gen = queueGen
+
+        val reqId = requestIdGenerator.incrementAndGet()
+        playJob?.cancel()
         prefetchJob?.cancel()
         retryJob?.cancel()
+
         streamAttempts = 0
         _queue.value = list
         _currentIndex.value = start
         val target = list[start]
         _isPreparing.value = !target.isLocal
+        if (target.durationMs > 0) {
+            _duration.value = target.durationMs
+        }
 
         recordHistory(target)
 
-        scope.launch {
-            val stageJob = if (!target.isLocal) {
-                scope.launch {
-                    while (gen == queueGen) {
-                        _resolveStage.value = youtube.lastError
-                        delay(300)
-                    }
-                }
-            } else null
-
+        playJob = scope.launch {
             try {
-                val url = streamFor(target)
-                if (gen != queueGen) return@launch
-                if (url == null) {
-                    _isPreparing.value = false
-                    Log.e(TAG, "Play failed: '${target.title}' — ${youtube.lastError}")
-                    _events.tryEmit("Could not play track: ${youtube.lastError.take(80)}")
+                _resolveStage.value = "Verifying exact track audio…"
+                val identity = TrackIdentity.fromSong(target)
+                val result = resolver.resolve(identity)
+
+                if (reqId != requestIdGenerator.get()) {
+                    Log.d(TAG, "playSongs: Aborted obsolete request #$reqId for '${target.title}'")
                     return@launch
                 }
-                Log.i(TAG, "Playing: '${target.title}' (local=${target.isLocal})")
-                persistVideoId(target)
-                pendingItems = listOf(mediaItem(target, url))
-                pendingStartIndex = 0
-                tryFlush()
 
-                // Only prefetch the next single song to avoid rate-limiting and expired URLs
-                prefetchNext(gen, start)
+                when (result) {
+                    is PlaybackResult.Success -> {
+                        Log.i(TAG, "PLAYING VERIFIED: '${target.title}' by '${target.artist}' (provider=${result.provider})")
+                        persistVideoId(target, result.streamUrl)
 
-                if (!target.isLocal) {
-                    val deadline = System.currentTimeMillis() + 8_000L
-                    while (gen == queueGen && _isPreparing.value &&
-                        System.currentTimeMillis() < deadline && !_isPlaying.value
-                    ) {
-                        delay(250)
+                        // Update current song metadata with verified artwork
+                        if (target.artworkUri.isNullOrBlank() && result.streamUrl.isNotBlank()) {
+                            ArtworkCache.get(identity)?.let { verifiedArt ->
+                                val enriched = target.copy(artworkUri = verifiedArt)
+                                _queue.value = _queue.value.map { if (it.id == target.id) enriched else it }
+                            }
+                        }
+
+                        pendingItems = listOf(mediaItem(target, result.streamUrl))
+                        pendingStartIndex = 0
+                        tryFlush()
+
+                        // Prefetch next song in background
+                        prefetchNext(reqId, start)
+
+                        if (!target.isLocal) {
+                            val deadline = System.currentTimeMillis() + 8_000L
+                            while (reqId == requestIdGenerator.get() && _isPreparing.value &&
+                                System.currentTimeMillis() < deadline && !_isPlaying.value
+                            ) {
+                                delay(250)
+                            }
+                            if (reqId == requestIdGenerator.get()) _isPreparing.value = false
+                        }
                     }
-                    if (gen == queueGen) _isPreparing.value = false
+                    is PlaybackResult.Unavailable -> {
+                        _isPreparing.value = false
+                        Log.e(TAG, "Play failed: '${target.title}' — ${result.reason}")
+                        _events.tryEmit("Unable to verify track: ${result.reason}")
+                    }
                 }
+            } catch (e: CancellationException) {
+                Log.d(TAG, "playSongs request #$reqId cancelled")
             } finally {
-                stageJob?.cancel()
-                if (gen == queueGen && retryJob?.isActive != true) {
+                if (reqId == requestIdGenerator.get() && retryJob?.isActive != true) {
                     _resolveStage.value = ""
                     _isPreparing.value = false
                 }
@@ -448,42 +475,46 @@ class PlayerManager(
         }
     }
 
-    private fun prefetchNext(gen: Int, from: Int) {
+    private fun prefetchNext(reqId: Long, from: Int) {
         prefetchJob?.cancel()
         prefetchJob = scope.launch {
             val list = _queue.value
             val nextIndex = from + 1
             if (nextIndex >= list.size) return@launch
             val nextSong = list[nextIndex]
+
             if (nextSong.isLocal) {
                 var c = controller
                 var waited = 0
-                while ((c == null || !c.isConnected) && waited < 15 && gen == queueGen) {
+                while ((c == null || !c.isConnected) && waited < 15 && reqId == requestIdGenerator.get()) {
                     delay(300); waited++
                     c = controller
                 }
                 val cc = c ?: return@launch
-                if (!cc.isConnected || gen != queueGen) return@launch
+                if (!cc.isConnected || reqId != requestIdGenerator.get()) return@launch
                 if (indexOfItem(cc, nextSong.id) < 0) {
                     cc.addMediaItem(cc.mediaItemCount, mediaItem(nextSong, nextSong.contentUri))
                 }
                 return@launch
             }
 
-            // For online next song, resolve stream URL quietly in background
-            val url = streamFor(nextSong) ?: return@launch
-            if (gen != queueGen) return@launch
-            persistVideoId(nextSong)
-            var c = controller
-            var waited = 0
-            while ((c == null || !c.isConnected) && waited < 15 && gen == queueGen) {
-                delay(300); waited++
-                c = controller
-            }
-            val cc = c ?: return@launch
-            if (!cc.isConnected || gen != queueGen) return@launch
-            if (indexOfItem(cc, nextSong.id) < 0) {
-                cc.addMediaItem(cc.mediaItemCount, mediaItem(nextSong, url))
+            val identity = TrackIdentity.fromSong(nextSong)
+            val result = resolver.resolve(identity)
+            if (reqId != requestIdGenerator.get()) return@launch
+
+            if (result is PlaybackResult.Success) {
+                persistVideoId(nextSong, result.streamUrl)
+                var c = controller
+                var waited = 0
+                while ((c == null || !c.isConnected) && waited < 15 && reqId == requestIdGenerator.get()) {
+                    delay(300); waited++
+                    c = controller
+                }
+                val cc = c ?: return@launch
+                if (!cc.isConnected || reqId != requestIdGenerator.get()) return@launch
+                if (indexOfItem(cc, nextSong.id) < 0) {
+                    cc.addMediaItem(cc.mediaItemCount, mediaItem(nextSong, result.streamUrl))
+                }
             }
         }
     }
@@ -498,7 +529,6 @@ class PlayerManager(
     }
 
     fun next() {
-        val c = controller
         val list = _queue.value
         if (list.isEmpty()) return
 
@@ -515,70 +545,74 @@ class PlayerManager(
         } else if (_repeat.value == Player.REPEAT_MODE_ALL) {
             playSongs(list, 0)
         } else {
-            c?.pause()
+            // Queue ended
+            controller?.pause()
         }
     }
 
     fun previous() {
         val c = controller
-        val list = _queue.value
-        if (list.isEmpty()) return
-
-        val pos = _position.value
-        if (pos > 3000L) {
-            seekTo(0)
+        if (c != null && c.currentPosition > 3000L) {
+            c.seekTo(0)
             return
         }
+        val list = _queue.value
+        if (list.isEmpty()) return
 
         val li = _currentIndex.value
         val prevIdx = li - 1
         if (prevIdx >= 0) {
             playSongs(list, prevIdx)
         } else {
-            seekTo(0)
+            playSongs(list, 0)
         }
     }
 
-    fun seekTo(ms: Long) {
-        controller?.let {
-            if (it.isConnected) it.seekTo(ms)
-        }
+    fun seekTo(posMs: Long) {
+        controller?.seekTo(posMs)
+        _position.value = posMs
     }
 
     fun toggleShuffle() {
-        val v = !_shuffle.value
-        _shuffle.value = v
-        controller?.let { if (it.isConnected) it.shuffleModeEnabled = v }
-        scope.launch { settings.setShuffle(v) }
+        setShuffle(!_shuffle.value)
     }
 
     fun cycleRepeat() {
-        val nextMode = when (_repeat.value) {
+        val next = when (_repeat.value) {
             Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
             Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
             else -> Player.REPEAT_MODE_OFF
         }
-        _repeat.value = nextMode
-        controller?.let { if (it.isConnected) it.repeatMode = nextMode }
-        scope.launch { settings.setRepeatMode(nextMode) }
-    }
-
-    fun playNext(song: Song) {
-        if (!isPlayable(song)) return
-        val q = _queue.value.toMutableList()
-        val idx = (_currentIndex.value + 1).coerceAtLeast(0)
-        q.add(idx.coerceAtMost(q.size), song)
-        _queue.value = q
+        setRepeatMode(next)
     }
 
     fun retryCurrentSong() {
-        val song = currentSong.value ?: return
-        youtube.clearFailures(song.id)
-        streamAttempts = 0
-        playSongs(_queue.value, _currentIndex.value)
+        val s = currentSong.value ?: return
+        val idx = _currentIndex.value
+        resolver.clearFailures(s.id)
+        playSongs(_queue.value, if (idx >= 0) idx else 0)
+    }
+
+    fun setShuffle(enabled: Boolean) {
+        _shuffle.value = enabled
+        controller?.shuffleModeEnabled = enabled
+        scope.launch { settings.setShuffle(enabled) }
+    }
+
+    fun setRepeatMode(mode: Int) {
+        _repeat.value = mode
+        controller?.repeatMode = mode
+        scope.launch { settings.setRepeatMode(mode) }
+    }
+
+    fun setVolume(vol: Float) {
+        val clamped = vol.coerceIn(0f, 1f)
+        _volume.value = clamped
+        controller?.volume = clamped
+    }
+
+    companion object {
+        private const val TAG = "PlayerManager"
+        private const val MAX_STREAM_ATTEMPTS = 3
     }
 }
-
-private const val RESOLVE_TIMEOUT_MS = 15_000L
-private const val MAX_STREAM_ATTEMPTS = 3
-private const val TAG = "ZyfenPlayer"

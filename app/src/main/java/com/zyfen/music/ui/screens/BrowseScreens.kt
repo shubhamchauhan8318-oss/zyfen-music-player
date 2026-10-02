@@ -182,6 +182,7 @@ fun AlbumDetailScreen(
     onBack: () -> Unit,
     onOpenPlayer: () -> Unit
 ) {
+    androidx.activity.compose.BackHandler { onBack() }
     val songs by vm.songs.collectAsState()
     val album = remember(songs, albumName) { buildAlbums(songs).firstOrNull { it.name == albumName } }
     val list = album?.songs.orEmpty()
@@ -191,9 +192,11 @@ fun AlbumDetailScreen(
         LazyColumn(Modifier.fillMaxSize()) {
             item {
                 Artwork(
-                    album?.artworkUri,
-                    Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 48.dp),
-                    12
+                    url = album?.artworkUri,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 48.dp),
+                    corner = 20,
+                    seed = album?.name.orEmpty(),
+                    title = album?.name.orEmpty()
                 )
                 Spacer(Modifier.height(20.dp))
                 Row(
@@ -237,6 +240,7 @@ fun ArtistDetailScreen(
     onBack: () -> Unit,
     onOpenPlayer: () -> Unit
 ) {
+    androidx.activity.compose.BackHandler { onBack() }
     val songs by vm.songs.collectAsState()
     val list = remember(songs, artistName) {
         songs.filter { it.isLocal && it.artist == artistName }

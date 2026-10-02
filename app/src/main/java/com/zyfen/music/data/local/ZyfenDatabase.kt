@@ -103,6 +103,12 @@ interface SongDao {
     @Query("UPDATE songs SET isFavorite = :fav WHERE id = :id")
     suspend fun setFavorite(id: String, fav: Boolean)
 
+    @Query("UPDATE songs SET artworkUri = :artworkUri WHERE id = :id")
+    suspend fun updateArtwork(id: String, artworkUri: String)
+
+    @Query("UPDATE songs SET title = :title, artist = :artist, artworkUri = :artworkUri WHERE id = :id")
+    suspend fun updateMetadata(id: String, title: String, artist: String, artworkUri: String?)
+
     @Query("DELETE FROM songs WHERE id = :id")
     suspend fun delete(id: String)
 
@@ -134,6 +140,9 @@ interface PlaylistDao {
 
     @Query("UPDATE playlists SET name = :newName WHERE id = :id")
     suspend fun renamePlaylist(id: String, newName: String)
+
+    @Query("UPDATE playlists SET artworkUrl = :newArtwork WHERE id = :id")
+    suspend fun updatePlaylistArtwork(id: String, newArtwork: String?)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun addSong(ref: PlaylistSongCrossRef)

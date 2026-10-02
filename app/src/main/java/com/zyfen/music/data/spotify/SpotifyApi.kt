@@ -18,7 +18,8 @@ data class SpotifyTrack(
     @Json(name = "artists") val artists: List<SpotifyArtist> = emptyList(),
     @Json(name = "album") val album: SpotifyAlbum? = null,
     @Json(name = "duration_ms") val durationMs: Long = 0,
-    @Json(name = "external_urls") val externalUrls: SpotifyExternalUrls? = null
+    @Json(name = "external_urls") val externalUrls: SpotifyExternalUrls? = null,
+    @Json(name = "preview_url") val previewUrl: String? = null
 )
 data class SpotifyPlaylistTrackItem(@Json(name = "track") val track: SpotifyTrack?)
 data class SpotifyPlaylistTracksPaging(
@@ -35,6 +36,10 @@ data class SpotifyPlaylist(
     @Json(name = "tracks") val tracks: SpotifyPlaylistTracksPaging
 )
 
+data class SpotifyTracksResponse(
+    @Json(name = "tracks") val tracks: List<SpotifyTrack?> = emptyList()
+)
+
 interface SpotifyService {
     @GET("playlists/{id}")
     suspend fun getPlaylist(
@@ -45,6 +50,9 @@ interface SpotifyService {
 
     @GET
     suspend fun getPlaylistPage(@Url url: String): SpotifyPlaylistTracksPaging
+
+    @GET("tracks")
+    suspend fun getTracks(@Query("ids") ids: String): SpotifyTracksResponse
 
     companion object {
         const val PAGE_SIZE = 100
@@ -60,7 +68,7 @@ object SpotifyLinkParser {
         val t = input.trim()
         Regex("spotify:playlist:([A-Za-z0-9]+)").find(t)?.let { return it.groupValues[1] }
         Regex("open\\.spotify\\.com/(?:intl-[a-z-]+/)?playlist/([A-Za-z0-9]+)").find(t)?.let { return it.groupValues[1] }
-        if (Regex("^[A-Za-z0-9]{22}$").matches(t)) return t
+        Regex("([A-Za-z0-9]{22})").find(t)?.let { return it.groupValues[1] }
         return null
     }
 }

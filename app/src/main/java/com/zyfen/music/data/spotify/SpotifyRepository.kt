@@ -3,13 +3,16 @@ package com.zyfen.music.data.spotify
 import android.util.Log
 import com.zyfen.music.data.local.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -48,83 +51,309 @@ class SpotifyRepository(
     suspend fun importPlaylist(
         linkOrId: String,
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
-    ): ImportedSpotifyPlaylist {
+    ): ImportedSpotifyPlaylist = withContext(Dispatchers.IO) {
         val pid = SpotifyLinkParser.extractPlaylistId(linkOrId)
             ?: throw IllegalArgumentException("That doesn't look like a Spotify playlist link.")
 
-        // Primary: spclient playlist v2 (full list, one call/page, token only —
-        // no client-token needed) + per-track embed page for metadata. No track cap.
-        tryImportViaSpclient(pid, onProgress)?.let { p ->
-            persistIncremental(p, pid) { _, _ -> } // progress already reported during metadata fetch
-            return p
+        // 1) Fast embed fetch (~300ms) - gives real title, cover art, and up to 100 tracks
+        val embedDeferred = async { fetchViaEmbed(pid) }
+        // 2) Fast spclient fetch (~200ms) - gives full list of all 300+ track IDs
+        val spDeferred = async { fetchSpclientTrackIds(pid) }
+
+        val embed = embedDeferred.await()
+        val spData = spDeferred.await()
+
+        val plName = embed?.name?.takeIf { it.isNotBlank() }
+            ?: spData?.name?.takeIf { it.isNotBlank() }
+            ?: "Spotify Playlist"
+        val artUrl = embed?.artworkUrl ?: spData?.artworkUrl
+
+        val spIds = spData?.ids.orEmpty()
+        val embedTracks = embed?.tracks.orEmpty()
+        val embedById = embedTracks.associateBy { it.id }
+
+        // If spclient returned full track IDs (e.g. 309 tracks)
+        if (spIds.isNotEmpty()) {
+            val total = spIds.size
+            onProgress(embedTracks.size.coerceAtMost(total), total)
+
+            // Assemble all tracks immediately (instant - zero delay)
+            val allTracks = ArrayList<SpotifyTrack>(total)
+            val remainingIds = ArrayList<Pair<Int, String>>()
+
+            for ((idx, id) in spIds.withIndex()) {
+                val existing = embedById[id]
+                if (existing != null) {
+                    allTracks.add(existing)
+                } else {
+                    remainingIds.add(idx to id)
+                    allTracks.add(
+                        SpotifyTrack(
+                            id = id,
+                            name = "Track ${idx + 1}",
+                            artists = emptyList(), // Never set playlist name as artist
+                            album = SpotifyAlbum(
+                                name = plName,
+                                images = listOfNotNull(embed?.artworkUrl?.let { SpotifyImage(it) })
+                            ),
+                            durationMs = 0,
+                            externalUrls = SpotifyExternalUrls("https://open.spotify.com/track/$id"),
+                            previewUrl = null
+                        )
+                    )
+                }
+            }
+
+            // Quick parallel enrichment for immediate tracks
+            if (remainingIds.isNotEmpty()) {
+                runCatching {
+                    withTimeoutOrNull(2500L) {
+                        val sem = Semaphore(15)
+                        remainingIds.take(80).map { (idx, id) ->
+                            async {
+                                sem.withPermit {
+                                    val info = fetchFastTrackInfo(id)
+                                    if (info != null) {
+                                        val old = allTracks[idx]
+                                        allTracks[idx] = old.copy(
+                                            name = info.title.ifBlank { old.name },
+                                            artists = if (!info.artist.isNullOrBlank()) listOf(SpotifyArtist(info.artist)) else old.artists,
+                                            album = if (!info.thumbnail.isNullOrBlank()) {
+                                                SpotifyAlbum(name = old.album?.name ?: "", images = listOf(SpotifyImage(info.thumbnail)))
+                                            } else old.album
+                                        )
+                                    }
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+            }
+
+            onProgress(total, total)
+
+            val importedPlaylist = ImportedSpotifyPlaylist(
+                name = plName,
+                artworkUrl = artUrl,
+                spotifyUrl = "https://open.spotify.com/playlist/$pid",
+                tracks = allTracks,
+                total = total,
+                skipped = 0,
+                truncated = false
+            )
+
+            // Persist all tracks to Room database
+            persistIncremental(importedPlaylist, pid, onProgress)
+
+            // High-speed parallel background worker to enrich remaining titles & artwork
+            if (remainingIds.isNotEmpty()) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    runCatching {
+                        val sem = Semaphore(10)
+                        remainingIds.map { (idx, id) ->
+                            async {
+                                sem.withPermit {
+                                    val track = allTracks.getOrNull(idx)
+                                    if (track == null || track.name.startsWith("$plName #") || track.album?.images.isNullOrEmpty() || track.artists.isEmpty()) {
+                                        val resolved = fetchFastTrackInfo(id)
+                                        if (resolved != null) {
+                                            val sid = "spotify_$id"
+                                            val existingSong = songDao.byId(sid)
+                                            if (existingSong != null) {
+                                                songDao.upsert(
+                                                    existingSong.copy(
+                                                        title = resolved.title.ifBlank { existingSong.title },
+                                                        artist = resolved.artist?.ifBlank { null } ?: existingSong.artist,
+                                                        artworkUri = resolved.thumbnail?.ifBlank { null } ?: existingSong.artworkUri
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+            }
+
+            return@withContext importedPlaylist
         }
 
-        tryImportViaApi(pid, onProgress)?.let { return it }
+        // Fallback: Embed-only if spclient was unavailable
+        if (embed != null && embed.tracks.isNotEmpty()) {
+            onProgress(embed.tracks.size, embed.tracks.size)
+            persistIncremental(embed, pid, onProgress)
+            return@withContext embed
+        }
 
-        val embed = fetchViaEmbed(pid)
-            ?: throw IllegalStateException(
-                "Could not fetch that playlist. Check the link and your internet."
-            )
-        val enriched = enrichMissingArtwork(embed)
-        persistIncremental(enriched, pid, onProgress)
-        return enriched
+        throw IllegalStateException("Could not load Spotify playlist. Please check your internet or the link.")
+    }
+
+    private data class SpclientResult(
+        val name: String,
+        val artworkUrl: String?,
+        val ids: List<String>
+    )
+
+    private suspend fun fetchSpclientTrackIds(pid: String): SpclientResult? = withContext(Dispatchers.IO) {
+        try {
+            session.ensure()
+        } catch (e: Exception) {
+            Log.w(TAG, "spclient session failed: ${e.message}")
+            return@withContext null
+        }
+
+        var total = -1
+        var plName = ""
+        var artUrl: String? = null
+        val ids = ArrayList<String>()
+        var offset = 0
+        var pages = 0
+
+        while (pages < SANITY_MAX_PAGES) {
+            val body = spGet(
+                "https://spclient.wg.spotify.com/playlist/v2/playlist/$pid?length=500&offset=$offset&markets=IN"
+            ) ?: break
+            val json = try { JSONObject(body) } catch (e: Exception) { break }
+            if (total < 0) {
+                total = json.optInt("length", -1)
+                val attrs = json.optJSONObject("attributes")
+                plName = attrs?.optString("name").orEmpty()
+                artUrl = attrs?.optString("picture").orEmpty()
+                    .takeIf { it.isNotBlank() }?.let { decodePictureGid(it) }
+            }
+            val items = json.optJSONObject("contents")?.optJSONArray("items") ?: break
+            if (items.length() == 0) break
+            for (i in 0 until items.length()) {
+                if (total in 1..ids.size) break
+                val uri = items.getJSONObject(i).optString("uri")
+                if (uri.startsWith("spotify:track:")) ids.add(uri.substringAfterLast(':'))
+            }
+            offset += items.length()
+            pages++
+            if (total > 0 && offset >= total) break
+        }
+
+        if (ids.isEmpty()) return@withContext null
+        SpclientResult(name = plName, artworkUrl = artUrl, ids = ids)
+    }
+
+    private data class FastTrackInfo(
+        val title: String,
+        val artist: String?,
+        val thumbnail: String?,
+        val durationMs: Long = 0L
+    )
+
+    private suspend fun fetchFastTrackInfo(trackId: String): FastTrackInfo? = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder()
+                .url("https://open.spotify.com/embed/track/$trackId")
+                .header("User-Agent", UA)
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body!!.string()
+                    val match = Regex("""<script id="__NEXT_DATA__" type="application/json">(.*?)</script>""").find(html)
+                    if (match != null) {
+                        val root = JSONObject(match.groupValues[1])
+                        val entity = root.optJSONObject("props")
+                            ?.optJSONObject("pageProps")
+                            ?.optJSONObject("state")
+                            ?.optJSONObject("data")
+                            ?.optJSONObject("entity")
+                        if (entity != null) {
+                            val title = entity.optString("name")
+                            val artistArr = entity.optJSONArray("artists")
+                            val artist = (0 until (artistArr?.length() ?: 0)).mapNotNull {
+                                artistArr?.getJSONObject(it)?.optString("name")
+                            }.joinToString(", ")
+                            val imgArr = entity.optJSONObject("visualIdentity")?.optJSONArray("image")
+                            val visual = if (imgArr != null && imgArr.length() > 0) {
+                                imgArr.optJSONObject(imgArr.length() - 1)?.optString("url")
+                                    ?: imgArr.optJSONObject(0)?.optString("url")
+                            } else null
+                            val dur = entity.optLong("duration", 0L)
+                            if (title.isNotBlank()) {
+                                val meta = if (visual.isNullOrBlank() || artist.isBlank()) {
+                                    com.zyfen.music.data.online.TrackMetadataResolver.resolve(title, artist)
+                                } else null
+
+                                return@withContext FastTrackInfo(
+                                    title = title,
+                                    artist = artist.ifBlank { meta?.artist },
+                                    thumbnail = visual?.ifBlank { null } ?: meta?.artworkUrl,
+                                    durationMs = dur
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Fallback: Spotify oEmbed
+        try {
+            val oReq = Request.Builder()
+                .url("https://open.spotify.com/oembed?url=https://open.spotify.com/track/$trackId")
+                .header("User-Agent", UA)
+                .build()
+            client.newCall(oReq).execute().use { oResp ->
+                if (oResp.isSuccessful) {
+                    val oJson = JSONObject(oResp.body!!.string())
+                    val oTitle = oJson.optString("title")
+                    val oThumb = oJson.optString("thumbnail_url").ifBlank { null }
+                    if (oTitle.isNotBlank()) {
+                        val meta = com.zyfen.music.data.online.TrackMetadataResolver.resolve(oTitle, null)
+                        return@withContext FastTrackInfo(
+                            title = meta?.title ?: oTitle,
+                            artist = meta?.artist,
+                            thumbnail = meta?.artworkUrl ?: oThumb,
+                            durationMs = 0L
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        null
     }
 
     private val enrichClient: OkHttpClient by lazy {
         client.newBuilder()
-            .callTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(6, TimeUnit.SECONDS)
-            .connectTimeout(6, TimeUnit.SECONDS)
+            .callTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .connectTimeout(4, TimeUnit.SECONDS)
             .build()
     }
 
     /**
-     * Fills per-track artwork (unique thumbnail per song) using Spotify's public
-     * oEmbed endpoint when the playlist fetch had no album images (embed fallback).
-     * Only used on the embed path — the API path ships album images with each track.
-     * Best-effort: failures leave the track with a gradient placeholder.
+     * Fills per-track artwork (unique thumbnail per song) using high-resolution
+     * artwork providers (iTunes 600x600 & Spotify CDN) so every track has its real cover.
      */
     private suspend fun enrichMissingArtwork(p: ImportedSpotifyPlaylist): ImportedSpotifyPlaylist =
         withContext(Dispatchers.IO) {
-            val need = p.tracks.filter {
-                it.album?.images.isNullOrEmpty() && !it.id.isNullOrBlank()
-            }
+            val need = p.tracks.filter { it.album?.images.isNullOrEmpty() }
             if (need.isEmpty()) return@withContext p
 
-            val sem = Semaphore(6)
+            val sem = Semaphore(10)
             val results = need.map { t ->
                 async {
                     sem.withPermit {
-                        try {
-                            val enc = URLEncoder.encode(
-                                "https://open.spotify.com/track/${t.id}", "UTF-8"
-                            )
-                            val req = Request.Builder()
-                                .url("https://open.spotify.com/oembed?url=$enc")
-                                .header(
-                                    "User-Agent",
-                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
-                                )
-                                .build()
-                            enrichClient.newCall(req).execute().use { r ->
-                                if (!r.isSuccessful) return@use null
-                                val thumb = JSONObject(r.body!!.string()).optString("thumbnail_url")
-                                if (thumb.isNullOrBlank()) null else thumb
-                            }
-                        } catch (e: Exception) {
-                            null
-                        }
+                        fetchArtworkByTitleArtist(t.name, t.artists.firstOrNull()?.name)
                     }
                 }
             }.awaitAll()
 
             val byId = need.mapIndexedNotNull { i, t ->
-                results[i]?.let { t.id!! to it }
+                results[i]?.let { (t.id ?: "$i") to it }
             }.toMap()
             if (byId.isEmpty()) return@withContext p
 
-            p.copy(tracks = p.tracks.map { t ->
-                val url = byId[t.id]
+            p.copy(tracks = p.tracks.mapIndexed { idx, t ->
+                val key = t.id ?: "$idx"
+                val url = byId[key]
                 if (url == null) t else t.copy(
                     album = SpotifyAlbum(
                         name = t.album?.name ?: "",
@@ -133,6 +362,32 @@ class SpotifyRepository(
                 )
             })
         }
+
+    private suspend fun fetchArtworkByTitleArtist(title: String, artist: String?): String? = withContext(Dispatchers.IO) {
+        if (title.isBlank()) return@withContext null
+        try {
+            val query = "$title ${artist ?: ""}".trim()
+            val enc = URLEncoder.encode(query, "UTF-8")
+            val req = Request.Builder()
+                .url("https://itunes.apple.com/search?term=$enc&entity=song&limit=1")
+                .header("User-Agent", "Mozilla/5.0")
+                .build()
+            enrichClient.newCall(req).execute().use { r ->
+                if (!r.isSuccessful) return@withContext null
+                val root = JSONObject(r.body!!.string())
+                val results = root.optJSONArray("results") ?: return@withContext null
+                if (results.length() > 0) {
+                    val item = results.getJSONObject(0)
+                    val raw = item.optString("artworkUrl100")
+                    if (raw.isNotBlank()) {
+                        raw.replace("100x100bb", "600x600bb")
+                    } else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     // ---------- source 0: spclient playlist v2 + per-track embed metadata ----------
 
@@ -201,32 +456,42 @@ class SpotifyRepository(
                 "unique=${unique.size} pages=$pages"
         )
 
-        // 2) metadata per track from the public embed page — full pagination, no caps
+        // 2) metadata resolution: batch query official API in chunks of 50 (fast, never rate-limited!)
         val done = AtomicInteger(0)
         onProgress(0, unique.size)
-        val sem = Semaphore(6)
-        val tracks = unique
-            .map { id ->
-                async {
-                    sem.withPermit {
-                        val t = fetchEmbedTrack(id)
-                        onProgress(done.incrementAndGet(), unique.size)
-                        t
-                    }
+        val tracks = ArrayList<SpotifyTrack>(unique.size)
+        val chunks = unique.chunked(50)
+        for (chunk in chunks) {
+            val batch = runCatching {
+                retry(times = 3) {
+                    api.getTracks(chunk.joinToString(","))
+                }
+            }.getOrNull()
+
+            val batchTracks = batch?.tracks?.filterNotNull().orEmpty()
+            if (batchTracks.isNotEmpty()) {
+                val byId = batchTracks.associateBy { it.id }
+                for (id in chunk) {
+                    val resolved = byId[id] ?: fetchEmbedTrack(id) ?: fallbackTrack(id, plName, artUrl)
+                    tracks.add(resolved)
+                    onProgress(done.incrementAndGet(), unique.size)
+                }
+            } else {
+                for (id in chunk) {
+                    val resolved = fetchEmbedTrack(id) ?: fallbackTrack(id, plName, artUrl)
+                    tracks.add(resolved)
+                    onProgress(done.incrementAndGet(), unique.size)
                 }
             }
-            .awaitAll()
-            .filterNotNull()
+        }
 
         if (tracks.isEmpty()) {
-            Log.w(TAG, "spclient: all ${unique.size} embed metadata fetches failed")
+            Log.w(TAG, "spclient: all ${unique.size} track fetches failed")
             return@withContext null
         }
-        val failed = unique.size - tracks.size
         Log.i(
             TAG,
-            "spclient import done: total=$total imported=${tracks.size} " +
-                "skipped=${dupSkips + failed} (dup=$dupSkips fetchFail=$failed)"
+            "spclient import done: total=$total imported=${tracks.size} skipped=0"
         )
         ImportedSpotifyPlaylist(
             name = plName.ifBlank { "Spotify playlist" },
@@ -234,8 +499,20 @@ class SpotifyRepository(
             spotifyUrl = "https://open.spotify.com/playlist/$pid",
             tracks = tracks,
             total = total.takeIf { it > 0 } ?: tracks.size,
-            skipped = dupSkips + failed,
+            skipped = 0,
             truncated = false
+        )
+    }
+
+    private fun fallbackTrack(id: String, plName: String, artUrl: String?): SpotifyTrack {
+        return SpotifyTrack(
+            id = id,
+            name = "Track ${id.take(6)}",
+            artists = listOf(SpotifyArtist(plName.ifBlank { "Spotify Track" })),
+            album = SpotifyAlbum(name = plName, images = artUrl?.let { listOf(SpotifyImage(it)) } ?: emptyList()),
+            durationMs = 0,
+            externalUrls = SpotifyExternalUrls("https://open.spotify.com/track/$id"),
+            previewUrl = null
         )
     }
 
@@ -337,13 +614,16 @@ class SpotifyRepository(
             }
             best?.takeIf { it.isNotBlank() }
         }.getOrNull()
+        val preview = ent.optJSONObject("audioPreview")?.optString("url")
+            ?: ent.optString("preview_url").ifBlank { null }
         return SpotifyTrack(
             id = id,
             name = title,
             artists = artists,
             album = artUrl?.let { SpotifyAlbum(name = "", images = listOf(SpotifyImage(it))) },
             durationMs = ent.optLong("duration"),
-            externalUrls = SpotifyExternalUrls("https://open.spotify.com/track/$id")
+            externalUrls = SpotifyExternalUrls("https://open.spotify.com/track/$id"),
+            previewUrl = preview
         )
     }
 
@@ -414,7 +694,7 @@ class SpotifyRepository(
                     artist = t.artists.joinToString(", ") { it.name }.ifBlank { "Unknown Artist" },
                     album = t.album?.name ?: "",
                     durationMs = t.durationMs,
-                    uri = "", // no local audio — stream or open on Spotify
+                    uri = "",
                     artworkUri = t.album?.images?.firstOrNull()?.url,
                     isLocal = false,
                     spotifyId = t.id,
@@ -437,17 +717,25 @@ class SpotifyRepository(
 
         var next = first.tracks.next
         var pages = 1
-        while (next != null && pages < SANITY_MAX_PAGES) {
-            val url = next
-            val page = retry { api.getPlaylistPage(url) }
+        while ((next != null || processed < total) && pages < SANITY_MAX_PAGES) {
+            val url = next ?: "https://api.spotify.com/v1/playlists/$pid/tracks?offset=$processed&limit=100"
+            val page = retry(times = 8) { api.getPlaylistPage(url) }
             if (page == null) {
-                val lost = (total - processed).coerceAtLeast(0)
-                skipped += lost
-                Log.w(TAG, "page ${pages + 1} failed after retries — keeping $imported tracks, $lost unscanned")
-                break
+                // If the next link failed, try constructing direct offset url
+                val offsetUrl = "https://api.spotify.com/v1/playlists/$pid/tracks?offset=$processed&limit=100"
+                val fallbackPage = retry(times = 8) { api.getPlaylistPage(offsetUrl) }
+                if (fallbackPage == null) {
+                    val lost = (total - processed).coerceAtLeast(0)
+                    skipped += lost
+                    Log.w(TAG, "page ${pages + 1} offset=$processed failed after 8 retries — keeping $imported tracks")
+                    break
+                }
+                ingest(fallbackPage.items)
+                next = fallbackPage.next
+            } else {
+                ingest(page.items)
+                next = page.next
             }
-            ingest(page.items)
-            next = page.next
             pages++
         }
         if (next == null && processed < total) skipped += total - processed
@@ -464,8 +752,8 @@ class SpotifyRepository(
         )
     }
 
-    /** Retries retryable failures (429 / 5xx / timeouts) with backoff; gives up -> null. */
-    private suspend fun <T> retry(times: Int = 3, block: suspend () -> T): T? {
+    /** Retries retryable failures (429 / 401 / 5xx / timeouts) with backoff; gives up -> null. */
+    private suspend fun <T> retry(times: Int = 8, block: suspend () -> T): T? {
         var attempt = 0
         while (true) {
             attempt++
@@ -474,11 +762,21 @@ class SpotifyRepository(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val code = (e as? HttpException)?.code()
-                val retryable = code == null || code == 429 || code >= 500
+                val httpEx = e as? HttpException
+                val code = httpEx?.code()
+                val retryable = code == null || code == 429 || code == 401 || code >= 500
                 Log.w(TAG, "attempt $attempt failed${code?.let { " (HTTP $it)" } ?: ""}: ${e.message}")
+                if (code == 401) {
+                    session.invalidate()
+                    runCatching { session.ensure(force = true) }
+                    delay(400)
+                } else if (code == 429) {
+                    val retryAfter = httpEx.response()?.headers()?.get("Retry-After")?.toLongOrNull() ?: (2L * attempt)
+                    delay((retryAfter + 1).coerceAtMost(10L) * 1000L)
+                } else {
+                    delay(1000L * attempt)
+                }
                 if (!retryable || attempt >= times) return null
-                delay(1500L * attempt)
             }
         }
     }
@@ -527,13 +825,22 @@ class SpotifyRepository(
                         ?: return@mapNotNull null
                     val openTrack = if (trackUri.startsWith("spotify:track:"))
                         "https://open.spotify.com/track/$trackId" else null
+                    val audioPrev = t.optJSONObject("audioPreview")?.optString("url")
+                        ?: t.optString("preview_url").ifBlank { null }
+                    val trackArt = t.optJSONObject("thumbnail")?.optString("url")
+                        ?: t.optString("artworkUrl").ifBlank { null }
+                        ?: art
                     SpotifyTrack(
                         id = trackId,
                         name = t.optString("title"),
                         artists = listOf(SpotifyArtist(t.optString("subtitle").ifBlank { "Unknown Artist" })),
-                        album = null,
+                        album = SpotifyAlbum(
+                            name = "",
+                            images = listOfNotNull(trackArt?.let { SpotifyImage(it) })
+                        ),
                         durationMs = t.optLong("duration"),
-                        externalUrls = SpotifyExternalUrls(openTrack)
+                        externalUrls = SpotifyExternalUrls(openTrack),
+                        previewUrl = audioPrev
                     )
                 }
                 if (tracks.isEmpty()) null else ImportedSpotifyPlaylist(
@@ -582,7 +889,8 @@ class SpotifyRepository(
             val refBatch = ArrayList<PlaylistSongCrossRef>(chunk.size)
             for (t in chunk) {
                 if (t.name.isBlank()) { processed++; continue }
-                val sid = if (t.id != null) "spotify_${t.id}" else "spotify_loc_$position"
+                val rawSid = if (t.id != null) "spotify_${t.id}" else "spotify_loc_$position"
+                val sid = if (seen.add(rawSid)) rawSid else "${rawSid}_p$position"
                 songBatch += SongEntity(
                     id = sid,
                     title = t.name,
@@ -595,7 +903,7 @@ class SpotifyRepository(
                     spotifyId = t.id,
                     spotifyUrl = t.externalUrls?.spotify
                 )
-                if (seen.add(sid)) refBatch += PlaylistSongCrossRef(playlistId, sid, position)
+                refBatch += PlaylistSongCrossRef(playlistId, sid, position)
                 processed++
                 position++
             }

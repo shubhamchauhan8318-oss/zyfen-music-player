@@ -39,9 +39,12 @@ class AppContainer(private val context: Context) {
     val settingsStore: SettingsStore by lazy { SettingsStore(context.dataStore) }
     val localRepo: LocalMusicRepository by lazy { LocalMusicRepository(context) }
     val youtubeSource: YouTubeSource by lazy { YouTubeSource() }
+    val playbackResolver: com.zyfen.music.data.source.PlaybackResolver by lazy {
+        com.zyfen.music.data.source.PlaybackResolver(youtubeSource)
+    }
 
     val playerManager: PlayerManager by lazy {
-        PlayerManager(context, settingsStore, youtubeSource, songDao)
+        PlayerManager(context, settingsStore, youtubeSource, songDao, playbackResolver)
     }
 
     private val moshi: Moshi by lazy {
@@ -53,6 +56,14 @@ class AppContainer(private val context: Context) {
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .build()
+    }
+
+    val songDownloader: com.zyfen.music.data.download.SongDownloader by lazy {
+        com.zyfen.music.data.download.SongDownloader(context, songDao, youtubeSource)
+    }
+
+    val onlineMusicRepo: com.zyfen.music.data.online.OnlineMusicRepository by lazy {
+        com.zyfen.music.data.online.OnlineMusicRepository(plainOkHttp)
     }
 
     val spotifySession: SpotifySession by lazy {

@@ -15,7 +15,8 @@ class LibraryViewModel(
     private val localRepo: LocalMusicRepository,
     private val songDao: SongDao,
     private val playlistDao: PlaylistDao,
-    val player: PlayerManager
+    val player: PlayerManager,
+    val downloader: com.zyfen.music.data.download.SongDownloader = com.zyfen.music.ZyfenApp.container.songDownloader
 ) : ViewModel() {
 
     private val _songs = MutableStateFlow<List<Song>>(emptyList())
@@ -77,10 +78,32 @@ class LibraryViewModel(
 
     fun toggleFavorite(song: Song) = viewModelScope.launch {
         val v = !song.isFavorite
-        songDao.upsert(song.copy(isFavorite = v).toEntity())
+        val updated = song.copy(isFavorite = v)
+        songDao.upsert(updated.toEntity())
         songDao.setFavorite(song.id, v)
-        _songs.value = _songs.value.map { if (it.id == song.id) it.copy(isFavorite = v) else it }
+        _songs.value = _songs.value.map { if (it.id == song.id) updated else it }
         _favorites.value = songDao.favorites().map { it.toSong() }
+
+        if (v) {
+            // User requested: Whenever any song is liked, automatically download it for offline use!
+            viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    downloader.download(updated)
+                    val dbSong = songDao.byId(song.id)
+                    if (dbSong != null) {
+                        val fresh = dbSong.toSong()
+                        _songs.value = _songs.value.map { if (it.id == song.id) fresh else it }
+                        _favorites.value = _favorites.value.map { if (it.id == song.id) fresh else it }
+                    }
+                }
+            }
+        }
+    }
+
+    fun updatePlaylistArtwork(id: String, artworkUrl: String?) = viewModelScope.launch {
+        playlistDao.updatePlaylistArtwork(id, artworkUrl)
+        _playlists.value = playlistDao.allPlaylists()
+        loadPlaylist(id)
     }
 
     fun createPlaylist(name: String) = viewModelScope.launch {
@@ -130,7 +153,38 @@ class LibraryViewModel(
     }
 
     fun loadPlaylist(id: String) = viewModelScope.launch {
-        _detail.value = playlistDao.withSongs(id)
+        val currentDetail = playlistDao.withSongs(id)
+        _detail.value = currentDetail
+
+        // Automatically resolve missing cover art & real artists for all tracks in playlist
+        if (currentDetail != null && currentDetail.songs.isNotEmpty()) {
+            val needsEnrichment = currentDetail.songs.filter {
+                it.artworkUri.isNullOrBlank() ||
+                it.artist.contains("zyfen", ignoreCase = true) ||
+                it.artist.contains("spotify", ignoreCase = true) ||
+                it.artist.equals("Unknown Artist", ignoreCase = true)
+            }
+            if (needsEnrichment.isNotEmpty()) {
+                viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var updatedAny = false
+                    for (entity in needsEnrichment) {
+                        val meta = com.zyfen.music.data.online.TrackMetadataResolver.resolve(entity.title, entity.artist)
+                        if (meta != null) {
+                            val newArt = meta.artworkUrl ?: entity.artworkUri
+                            val newArtist = meta.artist.ifBlank { entity.artist }
+                            val newTitle = meta.title.ifBlank { entity.title }
+                            if (newArt != entity.artworkUri || newArtist != entity.artist || newTitle != entity.title) {
+                                songDao.updateMetadata(entity.id, newTitle, newArtist, newArt)
+                                updatedAny = true
+                            }
+                        }
+                    }
+                    if (updatedAny) {
+                        _detail.value = playlistDao.withSongs(id)
+                    }
+                }
+            }
+        }
     }
 
     fun playPlaylist(id: String, startIndex: Int = 0) {

@@ -24,6 +24,7 @@ fun SpotifyImportScreen(
     lib: LibraryViewModel,
     onBack: () -> Unit = {}
 ) {
+    androidx.activity.compose.BackHandler { onBack() }
     var link by remember { mutableStateOf("") }
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
